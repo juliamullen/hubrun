@@ -18,7 +18,6 @@ logger.addHandler(handler)
 
 
 def send_slack_message(source, docs='?', elapsed_time='an unknown amount of', err_msg=False):
-    elapsed_minutes = round(elapsed_time / 60)
     if err_msg:
         message = f"{source} failed with the following error\n ```{err_msg}```"
     else:
@@ -29,21 +28,19 @@ def send_slack_message(source, docs='?', elapsed_time='an unknown amount of', er
 
 def get_document_count(release_name, previous=False):
     versions_url = f'https://biothings-releases.s3.amazonaws.com/{release_name}/versions.json'
+
+    # chronological so -1 for most recent and -2 for second most recent
     release_index = -2 if previous else -1
     latest_url   = requests.get(versions_url).json()['versions'][release_index]['url']
     changes_url  = requests.get(latest_url).json()['changes']['json']['url']
-    return int(requests.get(changes_url).json()['new']['_count'])
 
-def get_previous_document_count(release_name):
-    versions_url = f'https://biothings-releases.s3.amazonaws.com/{release_name}/versions.json'
-    latest_url   = requests.get(versions_url).json()['versions'][-2]['url']
-    changes_url  = requests.get(latest_url).json()['changes']['json']['url']
     return int(requests.get(changes_url).json()['new']['_count'])
 
 def create_build_name(plugin_name):
     letters_and_digits = string.ascii_lowercase + string.digits
     random_str = ''.join((random.choice(letters_and_digits) for i in range(8)))
     time_str = datetime.now().strftime("%Y%m%d%H%M%S")
+
     return "{}_{}_{}".format(plugin_name, time_str, random_str).lower()
 
 def get_previous_build_name(plugin_name):
@@ -84,6 +81,7 @@ def run_command(ssh_client, command):
         return False
 
     return True
+
 
 def wait_for_job_manager():
     retries = 0
@@ -153,7 +151,7 @@ def main():
                     # publish adds a version to versions.json
                     # we review the document counts from the new versus the old here
                     doc_count          = get_document_count(release_name)
-                    previous_doc_count = get_previous_document_count(release_name)
+                    previous_doc_count = get_document_count(release_name, previous=True)
                     if doc_count < previous_doc_count:
                         raise Exception(f"New document count ({doc_count}) less than older document count ({previous_doc_count})")
 
@@ -163,13 +161,14 @@ def main():
                 command = build_command.split('(')[0]
             except (NameError, TypeError):
                 command = '?'
-            err_msg = f"`{command}` {getattr(e, 'message')} {e}"
+            err_msg = f"`{command}` {getattr(e, 'message', '')} {e}"
 
         end_time = time.time()
-        send_slack_message(plugin, doc_count, (end_time - start_time), err_msg)
+        send_slack_message(plugin, doc_count, round((end_time - start_time) / 60), err_msg)
 
 if __name__ == '__main__':
     try:
         main()
     except Exception as e:
-        send_slack_message('builder', err_msg=f"{getattr(e, 'message')} {e}")
+        raise e
+        send_slack_message('builder', err_msg=f"{getattr(e, 'message', '')} {e}")
