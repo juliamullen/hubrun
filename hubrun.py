@@ -19,22 +19,26 @@ logger.addHandler(handler)
 
 def send_slack_message(source, docs='?', elapsed_time='an unknown amount of', err_msg=False):
     if err_msg:
-        message = f"{source} failed with the following error\n ```{err_msg}```"
+        message = f"❌ {source} failed during {err_msg}"
     else:
-        message = f"{source} updated in {elapsed_minutes} minutes with {docs} documents"
+        message = f"✅ {source} updated in {elapsed_time} minutes with {docs} documents"
 
     logger.info(message)
-    requests.post(secrets.SLACK_HOOK_URL, json={'text': message})
+    #requests.post(secrets.SLACK_HOOK_URL, json={'text': message})
 
 def get_document_count(release_name, previous=False):
     versions_url = f'https://biothings-releases.s3.amazonaws.com/{release_name}/versions.json'
 
-    # chronological so -1 for most recent and -2 for second most recent
-    release_index = -2 if previous else -1
-    latest_url   = requests.get(versions_url).json()['versions'][release_index]['url']
-    changes_url  = requests.get(latest_url).json()['changes']['json']['url']
+    try:
+        # chronological so -1 for most recent and -2 for second most recent
+        release_index = -2 if previous else -1
+        latest_url   = requests.get(versions_url).json()['versions'][release_index]['url']
+        changes_url  = requests.get(latest_url).json()['changes']['json']['url']
 
-    return int(requests.get(changes_url).json()['new']['_count'])
+        return int(requests.get(changes_url).json()['new']['_count'])
+    except Exception:
+        logger.exception('failure in get_document_count')
+        return 0
 
 def create_build_name(plugin_name):
     letters_and_digits = string.ascii_lowercase + string.digits
@@ -48,7 +52,8 @@ def get_previous_build_name(plugin_name):
     payload = build_request.json()
     try:
         return payload['result'][0]['_id']
-    except:
+    except Exception:
+        logger.exception('previous_build_name failure')
         return
 
 def job_manager_busy():
@@ -60,35 +65,29 @@ def job_manager_busy():
     return any(running_commands)
 
 def run_command(ssh_client, command):
-    logger.info(command)
     restart_url = 'http://localhost:19180/restart'
     job_manager_wait_retries = 0
 
-    while job_manager_busy():
-        logger.info('job mgr busy')
-        job_manager_wait_retries += 1
-        time.sleep(60)
-        if job_manager_wait_retries >= 10:
-            logger.info('took too long')
-            return False
-
-    ssh_client.exec_command(command)
-
-    if not wait_for_job_manager():
+    if wait_for_job_manager():
+        logger.info(command)
+        ssh_client.exec_command(command)
+    else:
+        logger.warning(f"{command} could not run, job manager was busy")
         logger.info('restarting')
         requests.put(restart_url)
         time.sleep(90)
-        return False
+        raise Exception(f"job manager busy when running {command}")
 
     return True
 
 
 def wait_for_job_manager():
+    logger.info('checking job manager')
     retries = 0
     time_waited = 0
 
     # check after 30s, then every minute for 5 minutes, then every 5m for three hours
-    wait_times = [30]
+    wait_times = [30, 30]
     wait_times.extend([60] * 5)
     wait_times.extend([300] * 36)
 
@@ -98,11 +97,14 @@ def wait_for_job_manager():
         time.sleep(wait_time)
         time_waited += wait_time
         print(f'{time_waited / 60} minutes', end='\r')
+
         if retries % 3 == 2:
             logger.info('waiting')
         if not job_manager_busy():
             if retries > 1:
                 logger.info(f'{retries} times {time_waited // 60} minutes')
+            else:
+                logger.info('did not wait')
             return True
 
     logger.info('waited too long')
@@ -130,10 +132,11 @@ def main():
     logger.info("Generating new releases for {}".format(', '.join(plugins)))
     outbreak_client = SSHClient()
     outbreak_client.set_missing_host_key_policy(AutoAddPolicy())
-    outbreak_client.connect(secrets.HUB_HOST, port=secrets.HUB_PORT, username=secrets.HUB_USERNAME, password=secrets.HUB_PASSWORD)
+    outbreak_client.connect(secrets.HUB_HOST, port=secrets.HUB_PORT, username=secrets.HUB_USERNAME, password=secrets.HUB_PASSWORD, look_for_keys=False)
     messages = []
 
     for plugin in plugins:
+        logger.info(f"➡️  {plugin}")
         err_msg = False
         doc_count = '?'
         try:
@@ -144,6 +147,7 @@ def main():
             previous_build_name = get_previous_build_name(plugin)
             for command in commands:
                 build_command = command.format(plugin=plugin, build_name=build_name, previous_build_name=previous_build_name, source_name=source_name, release_name=release_name)
+                logger.info(f"going to try to run {build_command}")
                 
                 run_command(outbreak_client, build_command)
 
@@ -153,22 +157,31 @@ def main():
                     doc_count          = get_document_count(release_name)
                     previous_doc_count = get_document_count(release_name, previous=True)
                     if doc_count < previous_doc_count:
-                        raise Exception(f"New document count ({doc_count}) less than older document count ({previous_doc_count})")
+                        logger.warn(f"New document count ({doc_count}) less than older document count ({previous_doc_count})")
+                        break
 
 
         except Exception as e:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            logger.exception(f'{e}')
             try:
-                command = build_command.split('(')[0]
+                command_short = build_command.split('(')[0]
             except (NameError, TypeError):
-                command = '?'
-            err_msg = f"`{command}` {getattr(e, 'message', '')} {e}"
+                command_short = '?'
+
+            logger.error(f"failure during {command_short}")
+            err_msg = f"`{command_short}` \n{exc_type} {exc_value}\n```{exc_traceback}```"
+            logger.warn(f"here's the slack message:\n{err_msg}")
 
         end_time = time.time()
         send_slack_message(plugin, doc_count, round((end_time - start_time) / 60), err_msg)
+
+        #if err_msg:
+        #    raise SystemExit
 
 if __name__ == '__main__':
     try:
         main()
     except Exception as e:
-        raise e
-        send_slack_message('builder', err_msg=f"{getattr(e, 'message', '')} {e}")
+        logger.exception(err_msg)
+        send_slack_message('builder', err_msg=f"{getattr(e, 'message', '')} {str(e)}")
